@@ -10,18 +10,44 @@ use Amp\Http\Client\HttpException;
 use Amp\Http\Client\Request;
 use GuzzleHttp\Ring\Future\CompletedFutureArray;
 use League\Uri\Uri;
+use Revolt\EventLoop;
 
 class AmpHandler
 {
     public function __construct(
-        protected HttpClient $client
+        protected HttpClient $client,
+        protected int $retryLimit = 3,
+        protected float $retryDelay = 0.1,
     )
     {
+        if ($this->retryLimit < 1) {
+            throw new \UnexpectedValueException('Retry limit must be a positive integer');
+        }
+        if ($this->retryDelay <= 0) {
+            throw new \UnexpectedValueException('Retry delay must be a positive float');
+        }
     }
 
     public function __invoke(array $request)
     {
+        $attempt = 0;
+        do {
+            if ($attempt>0) {
+                $suspension = EventLoop::getSuspension();
+                EventLoop::delay($this->retryDelay, static function () use ($suspension) {
+                    $suspension->resume();
+                });
+                $suspension->suspend();
+            }
+            $response = $this->performRequest($request);
+        } while (++$attempt <= $this->retryLimit && !empty($response['error']));
+        return new CompletedFutureArray($response);
+    }
+
+    private function performRequest(array $request)
+    {
         $response = [];
+        $bodyStream = \fopen('php://memory', 'rb+');
         try {
             $baseUri = $this->baseUri($request);
             $response['effective_url'] = $baseUri->toString();
@@ -30,7 +56,6 @@ class AmpHandler
             $ampRequest = $this->requestFromArray($fullUri, $request);
             $ampResponse = $this->client->request($ampRequest);
             $body = $ampResponse->getBody()->buffer();
-            $bodyStream = \fopen('php://memory', 'rb+');
             \fwrite($bodyStream, $body);
             \fseek($bodyStream, 0);
             $response['body'] = $bodyStream;
@@ -46,12 +71,13 @@ class AmpHandler
         } catch (HttpException|BufferException|StreamException $e) {
             $response['status'] = \Amp\Http\HttpStatus::INTERNAL_SERVER_ERROR;
             $response['reason'] = \Amp\Http\HttpStatus::getReason($response['status']);
+            $response['body'] = $bodyStream;
             $response['error'] = $e;
             $response['transfer_stats'] = [
                 'total_time' => 0
             ];
         }
-        return new CompletedFutureArray($response);
+        return $response;
     }
 
     private function baseUri(array $request): Uri
